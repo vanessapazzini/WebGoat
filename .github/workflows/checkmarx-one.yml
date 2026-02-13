@@ -1,0 +1,30 @@
+name: Checkmarx One Scan
+
+on:
+  push:
+    branches: [ "main" ]
+  pull_request:
+    branches: [ "main" ]
+  workflow_dispatch:
+
+jobs:
+  cxone-scan:
+    runs-on: ubuntu-latest
+    permissions:
+      security-events: write
+      contents: read
+      pull-requests: write
+      statuses: write
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Checkmarx One Scan
+        uses: Checkmarx/ast-github-action@2.3.30
+        with:
+          base_uri: https://eu.ast.checkmarx.net
+          cx_tenant: ${{ secrets.CX_TENANT }}
+          cx_client_id: ${{ secrets.CX_CLIENT_ID }}
+          cx_client_secret: ${{ secrets.CX_CLIENT_SECRET }}
+          project_name: "E-VASP-13.02"
+          branch: ${{ github.ref_name }}
