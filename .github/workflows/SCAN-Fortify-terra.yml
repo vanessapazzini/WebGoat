@@ -1,0 +1,380 @@
+name: Fortify SAST Scan
+
+on:
+  workflow_call:
+    inputs:
+      appVersion:
+        type: string
+        default: "DevSecOps"
+      repositoryName:
+        type: string
+        default: ""
+      appLanguage:
+        type: string
+        default: "other"
+      enableFortifyExclusions:
+        type: boolean
+        default: true
+      runs_on:
+        type: string
+        default: "self-hosted"
+    secrets:
+      FORTIFY_SSC_TOKEN:
+        required: true
+      FORTIFY_UNIFIED_LOGIN_TOKEN:
+        required: true
+      FORTIFY_SSC_API_URL:
+        required: true
+      FORTIFY_CONTROLLER_URL:
+        required: true
+      FORTIFY_CONTROLLER_TOKEN:
+        required: true
+
+env:
+  FORTIFY_SSC_API_URL: ${{ secrets.FORTIFY_SSC_API_URL }}
+  FORTIFY_CONTROLLER_URL: ${{ secrets.FORTIFY_CONTROLLER_URL }}
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+jobs:
+  fortify-sast:
+    name: Fortify SAST
+    runs-on: ${{ inputs.runs_on }}
+
+    steps:
+      - name: About the Job
+        run: |
+          echo "=================================================================="
+          echo "  Fortify SAST Scan — Evernow AppSec"
+          echo "  Repositorio : ${{ inputs.repositoryName || github.event.repository.name }}"
+          echo "  Versao SSC  : ${{ inputs.appVersion }}"
+          echo "  Branch      : ${{ github.ref_name }}"
+          echo "=================================================================="
+
+      - name: Checkout source
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Fortify ScanCentral Client
+        run: |
+          set -e
+          mkdir -p "${HOME}/.local/bin"
+
+          # Java (instala Temurin 21 se ausente — runner ARM64 nao tem Java pre-instalado)
+          if ! command -v java &>/dev/null; then
+            ARCH=$(uname -m)
+            JRE_ARCH="aarch64"; [ "$ARCH" = "x86_64" ] && JRE_ARCH="x64"
+            curl -fsSL \
+              "https://api.adoptium.net/v3/binary/latest/21/ga/linux/${JRE_ARCH}/jre/hotspot/normal/eclipse" \
+              -o /tmp/java.tar.gz
+            mkdir -p "${HOME}/.local/jre"
+            tar -xzf /tmp/java.tar.gz -C "${HOME}/.local/jre" --strip-components=1 > /dev/null 2>&1
+            export JAVA_HOME="${HOME}/.local/jre"
+            export PATH="${JAVA_HOME}/bin:${PATH}"
+            echo "${HOME}/.local/jre/bin" >> "$GITHUB_PATH"
+            echo "JAVA_HOME=${HOME}/.local/jre" >> "$GITHUB_ENV"
+          fi
+
+          # fcli.jar (cross-platform — sem build nativo ARM64)
+          FCLI_JAR="${HOME}/.local/bin/fcli.jar"
+          curl -fsSL \
+            "https://github.com/fortify/fcli/releases/download/v3.19.0/fcli.jar" \
+            -o "${FCLI_JAR}"
+          printf '#!/bin/bash\nexec java -jar "%s" "$@"\n' "${FCLI_JAR}" \
+            > "${HOME}/.local/bin/fcli"
+          chmod +x "${HOME}/.local/bin/fcli"
+          export PATH="${HOME}/.local/bin:${PATH}"
+          echo "${HOME}/.local/bin" >> "$GITHUB_PATH"
+
+          # ScanCentral 25.4 via fcli
+          # --no-with-jre: JRE embutido nao tem build ARM64; usa Java do PATH
+          fcli tool sc-client install --version=25.4 --no-with-jre -y > /dev/null 2>&1
+
+          SC_BIN=$(find "${HOME}" -name "scancentral" -maxdepth 10 2>/dev/null | head -1)
+          [ -z "$SC_BIN" ] && { echo "ERRO: scancentral nao encontrado"; exit 1; }
+          SC_BIN_DIR=$(dirname "$SC_BIN")
+          echo "${SC_BIN_DIR}" >> "$GITHUB_PATH"
+          export PATH="${SC_BIN_DIR}:${PATH}"
+
+      - name: Set SAST Variables
+        run: |
+          REPO_NAME="${{ inputs.repositoryName || github.event.repository.name }}"
+          echo "FORTIFY_APP_NAME=${REPO_NAME}" >> "$GITHUB_ENV"
+          echo "FORTIFY_APP_VERSION=${{ inputs.appVersion }}" >> "$GITHUB_ENV"
+
+      - name: Setup Fortify Exclusions
+        run: |
+          case "${{ inputs.appLanguage }}" in
+            java)   exclude='-exclude "**/*test*" -exclude "**/*test*/**/*" -exclude "**/*spec*/**/*" -exclude "**/*swagger*"' ;;
+            nodejs) exclude='-exclude "**/node_modules/**" -exclude "**/*test*" -exclude "**/*test*/**/*" -exclude "**/*spec*/**/*"' ;;
+            *)      exclude='-exclude "**/*test*" -exclude "**/*test*/**/*" -exclude "**/*spec*/**/*"' ;;
+          esac
+          echo "EXCLUDE_FILE_PARAM=$exclude" >> "$GITHUB_ENV"
+
+      - name: Search or Create Fortify Project/Version
+        env:
+          FORTIFY_TOKEN: ${{ secrets.FORTIFY_UNIFIED_LOGIN_TOKEN }}
+        run: |
+          HTTP_CODE=$(curl -skL -o /tmp/ssc_resp.json -w "%{http_code}" \
+            "${FORTIFY_SSC_API_URL}/projectVersions?q=${FORTIFY_APP_NAME}&fulltextsearch=true" \
+            -H "Accept: application/json" \
+            -H "Authorization: FortifyToken ${FORTIFY_TOKEN}")
+          [ "$HTTP_CODE" = "200" ] || { cat /tmp/ssc_resp.json | head -c 500; echo; exit 1; }
+          response=$(cat /tmp/ssc_resp.json)
+
+          fortify_project_id=$(echo "$response" | jq -r \
+            '.data[] | select(.project.name=="'"${FORTIFY_APP_NAME}"'") | .project.id' | head -1)
+          fortify_project_version_id=$(echo "$response" | jq -r \
+            '.data[] | select(.project.name=="'"${FORTIFY_APP_NAME}"'") | select(.name=="'"${FORTIFY_APP_VERSION}"'") | .id')
+
+          if [ -n "$fortify_project_version_id" ]; then
+            echo "Projeto e versao ja existem: ID ${fortify_project_version_id}"
+          elif [ -n "$fortify_project_id" ]; then
+            echo "Criando nova versao para projeto existente (ID ${fortify_project_id})..."
+            body="{\"project\":{\"name\":\"${FORTIFY_APP_NAME}\",\"id\":${fortify_project_id}},\"issueTemplateId\":\"Prioritized-HighRisk-Project-Template\",\"name\":\"${FORTIFY_APP_VERSION}\"}"
+            response=$(curl -sfkL -X POST "${FORTIFY_SSC_API_URL}/projectVersions" \
+              -H "Content-Type: application/json" -H "Accept: application/json" \
+              -H "Authorization: FortifyToken ${FORTIFY_TOKEN}" -d "$body")
+            fortify_project_version_id=$(echo "$response" | jq -r '.data.id')
+          else
+            echo "Criando novo projeto e versao..."
+            body="{\"project\":{\"name\":\"${FORTIFY_APP_NAME}\"},\"issueTemplateId\":\"Prioritized-HighRisk-Project-Template\",\"name\":\"${FORTIFY_APP_VERSION}\",\"customTagValuesAutoApply\":true,\"autoPredict\":true}"
+            response=$(curl -sfkL -X POST "${FORTIFY_SSC_API_URL}/projectVersions" \
+              -H "Content-Type: application/json" -H "Accept: application/json" \
+              -H "Authorization: FortifyToken ${FORTIFY_TOKEN}" -d "$body")
+            fortify_project_version_id=$(echo "$response" | jq -r '.data.id')
+            fortify_project_id=$(echo "$response" | jq -r '.data.project.id')
+          fi
+
+          echo "FORTIFY_PROJECT_VERSION_ID=${fortify_project_version_id}" >> "$GITHUB_ENV"
+          echo "Project Version ID: ${fortify_project_version_id}"
+
+          # Commitar a versao e configurar regras de processamento (necessario para aceitar upload de FPR)
+          bulk_body="{\"requests\":[
+            {\"uri\":\"${FORTIFY_SSC_API_URL}/projectVersions/${fortify_project_version_id}/attributes\",\"httpVerb\":\"PUT\",\"postData\":[{\"values\":[{\"guid\":\"New\"}],\"attributeDefinitionId\":5},{\"values\":[{\"guid\":\"Internal\"}],\"attributeDefinitionId\":6},{\"values\":[{\"guid\":\"internalnetwork\"}],\"attributeDefinitionId\":7}]},
+            {\"uri\":\"${FORTIFY_SSC_API_URL}/projectVersions/${fortify_project_version_id}/authEntities\",\"httpVerb\":\"PUT\",\"postData\":[]},
+            {\"uri\":\"${FORTIFY_SSC_API_URL}/projectVersions/${fortify_project_version_id}?hideProgress=true\",\"httpVerb\":\"PUT\",\"postData\":{\"committed\":true}}
+          ]}"
+          curl -sfkL -X POST "${FORTIFY_SSC_API_URL}/bulk" \
+            -H "Content-Type: application/json" -H "Accept: application/json" \
+            -H "Authorization: FortifyToken ${FORTIFY_TOKEN}" \
+            -d "$bulk_body" > /dev/null
+
+          curl -sfkL -X PUT "${FORTIFY_SSC_API_URL}/projectVersions/${fortify_project_version_id}/resultProcessingRules" \
+            -H "Content-Type: application/json" -H "Accept: application/json" \
+            -H "Authorization: FortifyToken ${FORTIFY_TOKEN}" \
+            -d '[{"identifier":"com.fortify.manager.BLL.processingrules.BuildProjectProcessingRule","enabled":false},{"identifier":"com.fortify.manager.BLL.processingrules.FileCountProcessingRule","enabled":false},{"identifier":"com.fortify.manager.BLL.processingrules.LOCCountProcessingRule","enabled":false},{"identifier":"com.fortify.manager.BLL.processingrules.NewerEngineVersionProcessingRule","enabled":false},{"identifier":"com.fortify.manager.BLL.processingrules.RulePackVersionProcessingRule","enabled":false},{"identifier":"com.fortify.manager.BLL.processingrules.WarningProcessingRule","enabled":false},{"identifier":"com.fortify.manager.BLL.processingrules.ExternalListVersionProcessingRule","enabled":false}]' \
+            > /dev/null
+          echo "Projeto configurado e commitado."
+
+      - name: Run Fortify SAST (ScanCentral)
+        env:
+          CTRL_TOKEN: ${{ secrets.FORTIFY_CONTROLLER_TOKEN }}
+          SSC_TOKEN: ${{ secrets.FORTIFY_UNIFIED_LOGIN_TOKEN }}
+        run: |
+          # CTRL_TOKEN = client_auth_token do Controller (shared secret)
+          # SSC_TOKEN  = CIToken do SSC (para -ssctoken e -uptoken)
+          PROPS_FILE=$(find "${HOME}" -name "client.properties" -path "*/sc-client/*" 2>/dev/null | head -1)
+          if [ -n "$PROPS_FILE" ]; then
+            sed -i '/^client_auth_token/d' "$PROPS_FILE"
+            echo "client_auth_token=${CTRL_TOKEN}" >> "$PROPS_FILE"
+          fi
+          export SCANCENTRAL_VM_OPTS="-Dclient_auth_token=${CTRL_TOKEN}"
+
+          SSC_BASE_URL="${FORTIFY_SSC_API_URL%/api/v1}"
+          eval scancentral \
+            -url "${FORTIFY_CONTROLLER_URL}" \
+            -sscurl "${SSC_BASE_URL}" \
+            -ssctoken "${SSC_TOKEN}" \
+            start ${EXCLUDE_FILE_PARAM} \
+            -upload -skipBuild -bt none -block \
+            --log-file fortify.log \
+            --overwrite \
+            --application "${FORTIFY_APP_NAME}" \
+            --application-version "${FORTIFY_APP_VERSION}" \
+            -uptoken "${SSC_TOKEN}"
+
+      - name: Fortify Summary
+        if: always()
+        env:
+          SSC_TOKEN: ${{ secrets.FORTIFY_UNIFIED_LOGIN_TOKEN }}
+        run: |
+          [ -z "${FORTIFY_PROJECT_VERSION_ID}" ] && echo "Project Version ID indisponivel." && exit 0
+
+          issues=$(curl -sfkL \
+            -H "Authorization: FortifyToken ${SSC_TOKEN}" \
+            -H "Accept: application/json" \
+            "${FORTIFY_SSC_API_URL}/projectVersions/${FORTIFY_PROJECT_VERSION_ID}/issues?limit=200")
+
+          cr=$(echo "$issues" | jq '[.data[] | select((.friority//.priority)=="Critical")] | length')
+          hi=$(echo "$issues" | jq '[.data[] | select((.friority//.priority)=="High")]     | length')
+          me=$(echo "$issues" | jq '[.data[] | select((.friority//.priority)=="Medium")]   | length')
+          lo=$(echo "$issues" | jq '[.data[] | select((.friority//.priority)=="Low")]      | length')
+          total=$(echo "$issues" | jq '.data | length')
+
+          TSEP="+------------------------------+------------+----------+------------------------------------------+"
+          CSEP="+------------------------------+----------+----------+----------+----------+---------+"
+
+          echo ""
+          echo "+--------------------- FORTIFY SAST SCAN SUMMARY --------------------+"
+          printf "| Projeto: %s %s\n" "${FORTIFY_APP_NAME}" "${FORTIFY_APP_VERSION}"
+          echo "+--------------------------------------------------------------------+"
+          printf "| Total: %d (CRITICAL: %d, HIGH: %d, MEDIUM: %d, LOW: %d)\n" \
+            "$total" "$cr" "$hi" "$me" "$lo"
+          echo "$TSEP"
+          printf "| %-28s | %-10s | %-8s | %-40s |\n" "CATEGORIA" "ISSUE ID" "SEVERITY" "ARQUIVO:LINHA"
+          echo "$TSEP"
+
+          if [ "$total" -eq 0 ]; then
+            printf "| %-95s |\n" "Nenhuma vulnerabilidade encontrada neste scan."
+          else
+            echo "$issues" | jq -r '
+              .data | .[0:10] | .[] |
+              [
+                ((.subCategoryName // .categoryName // .issueName // .subCategory // .category // .kingdom // "-") | if length > 28 then .[0:25]+"..." else . end),
+                (.id | tostring),
+                (.friority // .priority // "-"),
+                (((.fullFileName // "-") + ":" + ((.lineNumber // 0) | tostring))
+                  | if length > 40 then "..."+.[-37:] else . end)
+              ] | @tsv' | while IFS=$'\t' read -r cat id sev loc; do
+              printf "| %-28s | %-10s | %-8s | %-40s |\n" "$cat" "${id:0:10}" "${sev:0:8}" "$loc"
+            done
+
+            if [ "$total" -gt 10 ]; then
+              remaining=$((total - 10))
+              printf "| %-95s |\n" "... e mais ${remaining} vulnerabilidades (veja relatorio completo)"
+            fi
+          fi
+
+          echo "$TSEP"
+          echo ""
+
+          if [ "$total" -gt 0 ]; then
+            echo " ANALISE DETALHADA POR CATEGORIA:"
+            echo "$CSEP"
+            printf "| %-28s | %-8s | %-8s | %-8s | %-8s | %-7s |\n" \
+              "CATEGORIA" "CRITICAL" "HIGH" "MEDIUM" "LOW" "TOTAL"
+            echo "$CSEP"
+
+            echo "$issues" | jq -r '
+              .data[] |
+              [((.subCategoryName // .categoryName // .issueName // .subCategory // .category // .kingdom // "-") | if length > 28 then .[0:25]+"..." else . end),
+               (.friority // .priority // "-")] | @tsv' | \
+            awk -F'\t' '{
+              k=$1; s=$2; c[k SUBSEP s]++; cat[k]=1
+            } END {
+              for (k in cat) {
+                cr=c[k SUBSEP "Critical"]+0; hi=c[k SUBSEP "High"]+0
+                me=c[k SUBSEP "Medium"]+0;  lo=c[k SUBSEP "Low"]+0
+                printf "| %-28s | %8d | %8d | %8d | %8d | %7d |\n", \
+                  k, cr, hi, me, lo, cr+hi+me+lo
+                print "+------------------------------+----------+----------+----------+----------+---------+"
+              }
+            }'
+            echo ""
+          fi
+
+          echo "QUANTIDADE DE ISSUES POR SEVERIDADE:"
+          echo "+-----------------------------+"
+          printf "| CRITICAL: %17d |\n" "$cr"
+          printf "| HIGH:     %17d |\n" "$hi"
+          printf "| MEDIUM:   %17d |\n" "$me"
+          printf "| LOW:      %17d |\n" "$lo"
+          printf "| TOTAL:    %17d |\n" "$total"
+          echo "+-----------------------------+"
+          echo ""
+          echo "Relatorio Detalhado: https://ot-ssc.evn-viv.cc/ssc/html/ssc/version/${FORTIFY_PROJECT_VERSION_ID}/audit"
+          echo ""
+
+      - name: Fortify Gate
+        env:
+          SSC_TOKEN: ${{ secrets.FORTIFY_UNIFIED_LOGIN_TOKEN }}
+        run: |
+          [ -z "${FORTIFY_PROJECT_VERSION_ID}" ] && echo "Project Version ID indisponivel." && exit 1
+
+          tags=$(curl -sfkL \
+            -H "Authorization: FortifyToken ${SSC_TOKEN}" \
+            "${FORTIFY_SSC_API_URL}/customTags?start=0&limit=100&q=hidden%3Afalse")
+          author_guid=$(echo "$tags" | jq -r '.data[] | select(.name=="Author" and .customTagType=="CUSTOM") | .guid')
+          [ -z "$author_guid" ] && echo "Custom tag 'Author' nao encontrada no SSC." && exit 1
+
+          pv_tags=$(curl -sfkL \
+            -H "Authorization: FortifyToken ${SSC_TOKEN}" \
+            "${FORTIFY_SSC_API_URL}/projectVersions/${FORTIFY_PROJECT_VERSION_ID}/customTags?limit=100")
+          applied=$(echo "$pv_tags" | jq -r --arg g "$author_guid" '.data[] | select(.guid==$g) | .guid')
+          if [ -z "$applied" ]; then
+            payload=$(echo "$pv_tags" | jq --arg g "$author_guid" '[(.data[].guid), $g] | map({guid: .})')
+            curl -sfkL -X PUT \
+              -H "Authorization: FortifyToken ${SSC_TOKEN}" \
+              -H "Content-Type: application/json" \
+              -d "$payload" \
+              "${FORTIFY_SSC_API_URL}/projectVersions/${FORTIFY_PROJECT_VERSION_ID}/customTags" > /dev/null
+          fi
+
+          issues=$(curl -sfkL \
+            -H "Authorization: FortifyToken ${SSC_TOKEN}" \
+            -H "Accept: application/json" \
+            "${FORTIFY_SSC_API_URL}/projectVersions/${FORTIFY_PROJECT_VERSION_ID}/issues?limit=500")
+
+          echo "$issues" | jq -c \
+            '.data[] | select((.friority // .priority) == "Critical" or (.friority // .priority) == "High")' | \
+          while read -r issue; do
+            id=$(echo "$issue" | jq '.id')
+            rev=$(echo "$issue" | jq '.revision // 0')
+            file=$(echo "$issue" | jq -r '.fullFileName // .primaryLocation // ""' | sed 's|^\./||')
+            line=$(echo "$issue" | jq -r '.lineNumber // 0')
+            author="N/A"
+            if [ -f "$file" ] && [ "${line}" -gt 0 ] 2>/dev/null; then
+              author=$(git blame -L "${line},${line}" --porcelain "$file" 2>/dev/null \
+                | awk '/^author-mail/{gsub(/[<>]/,""); print $2; exit}')
+              [ -z "$author" ] && author="N/A"
+            fi
+            auth_payload=$(jq -n \
+              --argjson id "$id" --argjson rev "$rev" \
+              --arg guid "$author_guid" --arg email "$author" \
+              '{type:"AUDIT_ISSUE",values:{issues:[{id:$id,revision:$rev}],customTagAudit:[{customTagGuid:$guid,textValue:$email}],comment:"",hasTagComment:false}}')
+            curl -sfkL -X POST \
+              -H "Authorization: FortifyToken ${SSC_TOKEN}" \
+              -H "Content-Type: application/json" \
+              -d "$auth_payload" \
+              "${FORTIFY_SSC_API_URL}/projectVersions/${FORTIFY_PROJECT_VERSION_ID}/issues/action?silent=true" > /dev/null
+          done
+
+          filter=$(printf 'audited:false [fortify priority order]:critical [fortify priority order]:high' | jq -sRr '@uri')
+          result=$(curl -sfkL \
+            -H "Authorization: FortifyToken ${SSC_TOKEN}" \
+            -H "Accept: application/json" \
+            "${FORTIFY_SSC_API_URL}/projectVersions/${FORTIFY_PROJECT_VERSION_ID}/issues?qm=issues&q=${filter}")
+          num=$(echo "$result" | jq '.count // 0')
+
+          echo ""
+          if [ "$num" -gt 0 ]; then
+            echo "  ╔═══════════════════════════════════════════════════════════════════╗"
+            echo "  ║                                                                   ║"
+            echo "  ║   ██████   █████  ██ ██      ███████ ██████                       ║"
+            echo "  ║   ██      ██   ██ ██ ██      ██      ██   ██                      ║"
+            echo "  ║   █████   ███████ ██ ██      █████   ██   ██                      ║"
+            echo "  ║   ██      ██   ██ ██ ██      ██      ██   ██                      ║"
+            echo "  ║   ██      ██   ██ ██ ███████ ███████ ██████                       ║"
+            echo "  ║                                                                   ║"
+            echo "  ║   QUALITY GATE FAILED                                             ║"
+            printf "  ║   Vulnerabilidades: %-46s║\n" "${num} Critical/High nao auditadas"
+            echo "  ║                                                                   ║"
+            echo "  ╚═══════════════════════════════════════════════════════════════════╝"
+            echo ""
+            exit 1
+          fi
+
+          echo "  ╔═══════════════════════════════════════════════════════════════════╗"
+          echo "  ║                                                                   ║"
+          echo "  ║   ██████   █████  ███████ ███████ ███████ ██████                  ║"
+          echo "  ║   ██   ██ ██   ██ ██      ██      ██      ██   ██                 ║"
+          echo "  ║   ██████  ███████ ███████ ███████ █████   ██   ██                 ║"
+          echo "  ║   ██      ██   ██      ██      ██ ██      ██   ██                 ║"
+          echo "  ║   ██      ██   ██ ███████ ███████ ███████ ██████                  ║"
+          echo "  ║                                                                   ║"
+          echo "  ║   QUALITY GATE PASSED                                             ║"
+          echo "  ║   Nenhuma vulnerabilidade CRITICAL ou HIGH encontrada.            ║"
+          echo "  ║                                                                   ║"
+          echo "  ╚═══════════════════════════════════════════════════════════════════╝"
+          echo ""
