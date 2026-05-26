@@ -10,13 +10,13 @@ on:
 jobs:
   fortify_sast:
    name: Fortify SAST
-   uses: ./.github/workflows/SCA-terra.yml
+   uses: evernowbr/actions-toolkit/.github/workflows/SCAN-Fortify-terra.yml@main
    with:
      appVersion: ${{ github.ref_name }}
      repositoryName: ${{ github.event.repository.name }}
      appLanguage: "other"
      enableFortifyExclusions: true
-     runs_on: ubuntu-latest
+     runs_on: self-hosted
    secrets:
      FORTIFY_SSC_TOKEN: ${{ secrets.FORTIFY_SSC_TOKEN }}
      FORTIFY_UNIFIED_LOGIN_TOKEN: ${{ secrets.FORTIFY_UNIFIED_LOGIN_TOKEN }}
@@ -24,13 +24,11 @@ jobs:
      FORTIFY_CONTROLLER_URL: ${{ secrets.FORTIFY_CONTROLLER_URL }}
      FORTIFY_CONTROLLER_TOKEN: ${{ secrets.FORTIFY_CONTROLLER_TOKEN }}
      
-  
-dependency_track:
-  name: SCA (Dependency-Track)
-  uses: ./.github/workflows/SCA-terra.yml
-  with:
-    appVersion: ${{ github.ref_name }}
-    repositoryName: ${{ github.event.repository.name }}
-  secrets:
-    DEPENDENCY_TRACK_TOKEN: ${{ secrets.DEPENDENCY_TRACK_TOKEN }}
-
+  dependency_track:
+    name: SCA (Dependency-Track)
+    uses: evernowbr/actions-toolkit/.github/workflows/SCA-terra.yml@main
+    with:
+      appVersion: ${{ github.ref_name }}
+      repositoryName: ${{ github.event.repository.name }}
+    secrets:
+      DEPENDENCY_TRACK_TOKEN: ${{ secrets.DEPENDENCY_TRACK_TOKEN }}
