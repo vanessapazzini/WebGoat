@@ -1,9 +1,9 @@
 # ============================================================
-#  SCA Scan (Syft + Dependency-Track) — GitHub Actions
+#  SCA Scan (Syft + Dependency-Track) — GitHub Actions (reusable workflow)
 #  DT Evernow: https://sca.evn-viv.cc/
 #
-#  Secret necessário:
-#    DEPENDENCY_TRACK_TOKEN
+#  Secrets necessarios no repositorio / org:
+#    DEPENDENCY_TRACK_TOKEN   - API key do Dependency-Track Evernow
 # ============================================================
 
 name: SCA Scan (Dependency-Track)
@@ -12,17 +12,21 @@ on:
   workflow_call:
     inputs:
       appVersion:
+        description: "Versao do projeto no DT"
         type: string
         default: "DevSecOps"
-
       repositoryName:
+        description: "Nome do repositorio (padrao: nome do repo atual)"
         type: string
         default: ""
-
       skipSecurityGate:
+        description: "Pular validacao do security gate"
         type: boolean
         default: false
-
+      vivoFlow:
+        description: "Branches que devem ser escaneadas (none = todas)"
+        type: string
+        default: "none"
     secrets:
       DEPENDENCY_TRACK_TOKEN:
         required: true
@@ -34,11 +38,19 @@ env:
 
 jobs:
   sca-scan:
-    runs-on: ubuntu-latest
+    name: SCA (Dependency-Track)
+    runs-on: self-hosted
+
+    if: |
+      inputs.vivoFlow == 'none' ||
+      github.ref_name == 'master' ||
+      github.ref_name == 'main' ||
+      startsWith(github.ref_name, 'release/') ||
+      contains(inputs.vivoFlow, github.ref_name)
 
     steps:
 
-      # ── Banner ─────────────────────────────
+      # ── Banner ──────────────────────────────────────────────────────────
       - name: About the Job
         run: |
           echo "=================================================================="
@@ -48,24 +60,18 @@ jobs:
           echo "  Branch      : ${{ github.ref_name }}"
           echo "=================================================================="
 
-      # ── Checkout ────────────────────────────
+      # ── Checkout ────────────────────────────────────────────────────────
       - name: Checkout source
         uses: actions/checkout@v4
 
-      # ── Dependências ────────────────────────
-      - name: Install dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y jq curl python3
-
-      # ── Variáveis ───────────────────────────
+      # ── Variaveis SCA ────────────────────────────────────────────────────
       - name: Set SCA Variables
         run: |
           REPO_NAME="${{ inputs.repositoryName || github.event.repository.name }}"
           echo "DT_APP_DEFAULT_NAME=${REPO_NAME}" >> "$GITHUB_ENV"
           echo "DT_APP_DEFAULT_VERSION=${{ inputs.appVersion }}" >> "$GITHUB_ENV"
 
-      # ── Instalar Syft ───────────────────────
+      # ── Instalar Syft ────────────────────────────────────────────────────
       - name: Install Syft
         run: |
           if ! command -v syft &>/dev/null; then
@@ -74,24 +80,17 @@ jobs:
             echo "Syft $(syft version | head -1)"
           fi
 
-      # ── Gerar SBOM ──────────────────────────
-      - name: Generate SBOM
+      # ── Gerar SBOM com Syft ──────────────────────────────────────────────
+      - name: Generate SBOM with Syft
         run: |
           syft dir:${{ github.workspace }} -o cyclonedx-json=cyclonedx_report.json
+          [[ -f cyclonedx_report.json ]] || { echo "::error::SBOM nao gerado"; exit 1; }
+          echo "SBOM gerado: $(jq '.components | length' cyclonedx_report.json) componentes"
 
-          if [ ! -f cyclonedx_report.json ]; then
-            echo "::error::SBOM nao gerado"
-            exit 1
-          fi
-
-          echo "SBOM gerado:"
-          jq '.components | length' cyclonedx_report.json
-
-      # ── Upload SBOM ─────────────────────────
+      # ── Upload SBOM para Dependency-Track ────────────────────────────────
       - name: Upload SBOM to Dependency-Track
         run: |
           BOMCONTENT=$(base64 -w 0 cyclonedx_report.json)
-
           PAYLOAD=$(jq -n \
             --arg name "${DT_APP_DEFAULT_NAME}" \
             --arg ver  "${DT_APP_DEFAULT_VERSION}" \
@@ -105,79 +104,170 @@ jobs:
             -d "${PAYLOAD}")
 
           echo "DT upload HTTP ${HTTP}"
-
-          if [ "$HTTP" != "200" ]; then
-            echo "::error::Falha upload DT"
-            cat /tmp/dt_resp.json
-            exit 1
-          fi
+          [[ "$HTTP" == "200" ]] || { echo "::error::Falha upload DT (HTTP ${HTTP}): $(cat /tmp/dt_resp.json)"; exit 1; }
 
           TOKEN=$(jq -r '.token' /tmp/dt_resp.json)
           echo "SBOM_TOKEN=${TOKEN}" >> "$GITHUB_ENV"
 
-      # ── Esperar processamento ───────────────
+      # ── Aguardar processamento ────────────────────────────────────────────
       - name: Wait for DT Processing
         run: |
-          echo "Aguardando processamento..."
-
+          echo "Aguardando processamento no Dependency-Track..."
           for i in $(seq 1 25); do
             RESP=$(curl -sf "${DT_SCA_ENDPOINT}/v1/event/token/${SBOM_TOKEN}" \
               -H "X-API-Key: ${{ secrets.DEPENDENCY_TRACK_TOKEN }}")
-
-            if [ "$(echo "$RESP" | jq -r '.processing')" = "false" ]; then
-              break
-            fi
-
-            echo "Tentativa ${i}/25..."
+            [[ "$(echo "$RESP" | jq -r '.processing')" == "false" ]] && break
+            echo "  [${i}/25] processando... aguardando 15s"
             sleep 15
+            [[ $i -eq 25 ]] && { echo "::error::Timeout aguardando DT"; exit 1; }
           done
 
           ENC=$(python3 -c "import urllib.parse; print(urllib.parse.quote('${DT_APP_DEFAULT_NAME}', safe=''))")
-
           PROJ=$(curl -sf "${DT_SCA_ENDPOINT}/v1/project/lookup?name=${ENC}&version=${DT_APP_DEFAULT_VERSION}" \
             -H "X-API-Key: ${{ secrets.DEPENDENCY_TRACK_TOKEN }}")
 
           ID=$(echo "$PROJ" | jq -r '.uuid')
           echo "DT_PROJECT_ID=${ID}" >> "$GITHUB_ENV"
+          echo "Sincronizacao concluida. Project ID: ${ID}"
 
-      # ── Summary ─────────────────────────────
+      # ── Summary ──────────────────────────────────────────────────────────
       - name: Dependency-Track Summary
         if: always()
         run: |
           METRICS=$(curl -s "${DT_SCA_ENDPOINT}/v1/metrics/project/${DT_PROJECT_ID}/current" \
             -H "X-API-Key: ${{ secrets.DEPENDENCY_TRACK_TOKEN }}")
 
-          TOTAL=$(echo "$METRICS" | jq -r '.vulnerabilities // 0')
+          CRITICAL=$(echo "$METRICS" | jq -r '.critical             // 0')
+          HIGH=$(echo "$METRICS"     | jq -r '.high                 // 0')
+          MEDIUM=$(echo "$METRICS"   | jq -r '.medium               // 0')
+          LOW=$(echo "$METRICS"      | jq -r '.low                  // 0')
+          TOTAL=$(echo "$METRICS"    | jq -r '.vulnerabilities      // 0')
+          COMPS=$(echo "$METRICS"    | jq -r '.components           // 0')
+          VULN_C=$(echo "$METRICS"   | jq -r '.vulnerableComponents // 0')
 
-          echo "Total de vulnerabilidades: ${TOTAL}"
+          DT_LINK="${DT_FRONTEND_URL}/projects/${DT_PROJECT_ID}"
 
-      # ── Security Gate ───────────────────────
-      - name: Security Gate
+          echo ""
+          echo "============================================================"
+          echo "  DEPENDENCY-TRACK — RESULTADO DO SCAN SCA"
+          echo "============================================================"
+          echo "  Projeto   : ${DT_APP_DEFAULT_NAME}"
+          echo "  Versao    : ${DT_APP_DEFAULT_VERSION}"
+          echo "  Branch    : ${{ github.ref_name }}"
+          echo "------------------------------------------------------------"
+          echo "  Componentes         : ${COMPS} (vulneraveis: ${VULN_C})"
+          echo "------------------------------------------------------------"
+          echo "  Critica             : ${CRITICAL}"
+          echo "  Alta                : ${HIGH}"
+          echo "  Media               : ${MEDIUM}"
+          echo "  Baixa               : ${LOW}"
+          echo "  Total               : ${TOTAL}"
+          echo "------------------------------------------------------------"
+          echo "  Relatorio           : ${DT_LINK}"
+          echo "============================================================"
+          echo ""
+
+          if [[ -n "$GITHUB_STEP_SUMMARY" ]]; then
+            {
+              echo "## SCA — Dependency-Track"
+              echo ""
+              echo "| | |"
+              echo "|---|---|"
+              echo "| **Projeto** | \`${DT_APP_DEFAULT_NAME}\` |"
+              echo "| **Versao** | \`${DT_APP_DEFAULT_VERSION}\` |"
+              echo "| **Branch** | \`${{ github.ref_name }}\` |"
+              echo "| **Relatorio** | [Abrir no Dependency-Track](${DT_LINK}) |"
+              echo ""
+              echo "### Vulnerabilidades"
+              echo ""
+              echo "| Severidade | Qtd |"
+              echo "|------------|-----|"
+              echo "| 🔴 Critica | **${CRITICAL}** |"
+              echo "| 🟠 Alta | **${HIGH}** |"
+              echo "| 🟡 Media | ${MEDIUM} |"
+              echo "| 🟢 Baixa | ${LOW} |"
+              echo "| **Total** | **${TOTAL}** |"
+              echo ""
+              echo "> Componentes: **${COMPS}** total, **${VULN_C}** vulneraveis"
+            } >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      # ── Security Gate ─────────────────────────────────────────────────────
+      - name: Security Gate SCA
         if: ${{ !inputs.skipSecurityGate }}
         run: |
           RESP=$(curl -sf \
-            "${DT_SCA_ENDPOINT}/v1/violation/project/${DT_PROJECT_ID}" \
-            -H "X-API-Key: ${{ secrets.DEPENDENCY_TRACK_TOKEN }}")
+            "${DT_SCA_ENDPOINT}/v1/violation/project/${DT_PROJECT_ID}?pageNumber=1&pageSize=1000" \
+            -H "X-API-Key: ${{ secrets.DEPENDENCY_TRACK_TOKEN }}") || {
+              echo "::error::DT nao respondeu. Contate appsec_vivo.br@telefonica.com"
+              exit 1
+            }
 
-          COUNT=$(echo "$RESP" | jq 'length')
+          COUNT=$(echo "$RESP" | jq '[.[] | select(
+            (.analysis.analysisState=="NOT_SET") or
+            (.analysis==null) or
+            (.analysis.analysisState==null)
+          )] | length')
 
-          if [ "$COUNT" -gt 0 ]; then
-            echo "Falha no Security Gate!"
+          echo ""
+          if [[ "$COUNT" -gt 0 ]]; then
+            echo "  ╔═══════════════════════════════════════════════════════════════════╗"
+            echo "  ║                                                                   ║"
+            echo "  ║   ██████   █████  ██ ██      ███████ ██████                      ║"
+            echo "  ║   ██      ██   ██ ██ ██      ██      ██   ██                     ║"
+            echo "  ║   █████   ███████ ██ ██      █████   ██   ██                     ║"
+            echo "  ║   ██      ██   ██ ██ ██      ██      ██   ██                     ║"
+            echo "  ║   ██      ██   ██ ██ ███████ ███████ ██████                      ║"
+            echo "  ║                                                                   ║"
+            echo "  ║   QUALITY GATE FAILED                                             ║"
+            echo "  ║   Violacoes sem triagem: ${COUNT}"
+            echo "  ║                                                                   ║"
+            echo "  ╚═══════════════════════════════════════════════════════════════════╝"
+            echo ""
+            echo "Componentes bloqueantes:"
+            echo "-------------------------------------------------------------------"
+            echo "$RESP" | jq -r '
+              .[] |
+              select(
+                (.analysis.analysisState=="NOT_SET") or
+                (.analysis==null) or
+                (.analysis.analysisState==null)
+              ) |
+              "  \(.component.name) \(.component.version // "?")  |  \(.type)  |  \(.uuid)"
+            '
+            echo "-------------------------------------------------------------------"
+            echo "Suporte: Evernow +55(11)5028-1152 | appsec_vivo.br@telefonica.com"
+            mkdir -p violations
+            echo "$RESP" > violations/sca-violations.json
             exit 1
           fi
 
-      # ── Artifact SBOM ───────────────────────
+          echo "  ╔═══════════════════════════════════════════════════════════════════╗"
+          echo "  ║                                                                   ║"
+          echo "  ║   ██████   █████  ███████ ███████ ███████ ██████                 ║"
+          echo "  ║   ██   ██ ██   ██ ██      ██      ██      ██   ██                ║"
+          echo "  ║   ██████  ███████ ███████ ███████ █████   ██   ██                ║"
+          echo "  ║   ██      ██   ██      ██      ██ ██      ██   ██                ║"
+          echo "  ║   ██      ██   ██ ███████ ███████ ███████ ██████                 ║"
+          echo "  ║                                                                   ║"
+          echo "  ║   QUALITY GATE PASSED                                             ║"
+          echo "  ║   Nenhuma violacao de politica encontrada.                        ║"
+          echo "  ║                                                                   ║"
+          echo "  ╚═══════════════════════════════════════════════════════════════════╝"
+          echo ""
+
+      # ── Publicar SBOM ────────────────────────────────────────────────────
       - name: Upload SBOM Artifact
         uses: actions/upload-artifact@v4
         with:
           name: sbom-cyclonedx
           path: cyclonedx_report.json
 
-      # ── Artifact Violations ─────────────────
-      - name: Upload Violations
+      # ── Publicar violacoes (se gate falhar) ───────────────────────────────
+      - name: Upload SCA Violations Report
         if: failure()
         uses: actions/upload-artifact@v4
         with:
           name: sca-violations
-          path: /tmp/dt_resp.json
+          path: violations/sca-violations.json
           if-no-files-found: ignore
