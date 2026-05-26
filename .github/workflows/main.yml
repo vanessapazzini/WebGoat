@@ -10,7 +10,7 @@ on:
 jobs:
   fortify_sast:
    name: Fortify SAST
-   uses: evernowbr/actions-toolkit/.github/workflows/SCAN-Fortify-terra.yml@main
+   uses: ./.github/workflows/SCA-terra.yml
    with:
      appVersion: ${{ github.ref_name }}
      repositoryName: ${{ github.event.repository.name }}
