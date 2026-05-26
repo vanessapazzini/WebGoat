@@ -39,7 +39,7 @@ env:
 jobs:
   sca-scan:
     name: SCA (Dependency-Track)
-    runs-on: self-hosted
+    runs-on: ubuntu-latest
 
     if: |
       inputs.vivoFlow == 'none' ||
